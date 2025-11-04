@@ -1,20 +1,27 @@
+from pyspark.sql import SparkSession, functions as F, types as T
 from sentence_transformers import SentenceTransformer
+from typing import List, Optional
+import numpy as np
+
+from pipeline.utils import normalize_rows
 
 def build_spark(app_name="ClinicalVectorSearch"):
+
+    host = "spark://spark:7077"
+    print(f"Building Spark Session..., host: {host}")
     spark = (
         SparkSession.builder
         .appName(app_name)
+        .master(host)
         .config("spark.sql.execution.arrow.pyspark.enabled", "true")
+        .config("spark.executorEnv.PYTHONPATH", "/app/src")
+        # .config("spark.driver.host", "host.docker.internal")
+        # .config("spark.driver.port", "4041")
+        # .config("spark.driver.bindAddress", "0.0.0.0")
+        # .config("spark.submit.deployMode", "client")
         .getOrCreate()
     )
     return spark
-
-def clean_text(x: Optional[str]) -> Optional[str]:
-    if x is None:
-        return None
-    x = x.replace("\r", " ").replace("\n", " ")
-    x = " ".join(x.split())
-    return x
 
 def embed_partition(texts: List[str], model_name: str) -> List[List[float]]:
     model = SentenceTransformer(model_name)
