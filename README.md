@@ -10,10 +10,10 @@
 ## Doker commands to setup
 
 ```bash
-#Build and start containers in a detached mode
+# build and start containers in a detached mode
 docker-compose up --build -d
 
-#Access Spark worker container to run main commands for local run)
+# access spark worker container to run main commands (for local run)
 docker exec -it spark-worker-container-name bash
 ```
 
@@ -42,8 +42,4 @@ docker exec -it spark-worker-container-name bash
       --enable_hybrid \
       --bm25_topk 100 \
       --mmr_lambda 0.6
-
-Dependencies (pip):
-  pyspark sentence-transformers faiss-cpu numpy pandas scikit-learn rank-bm25
-Optional:
-  tenseal  (for FHE POC)
+```
