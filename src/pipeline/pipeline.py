@@ -13,35 +13,38 @@ def load_mtsamples_df(spark, data_path: str) -> pd.DataFrame:
 
     # import pdb; pdb.set_trace()
     sdf = spark.read.csv(data_path, header=True, multiLine=True, escape='"')
-    # normalize column names we care about
+    print(f"Rows Loaded: {sdf.count()}")
+    # normalize column names
     cols = [c.lower() for c in sdf.columns]
     print("sdf cols", cols)
-    mapping = {}
 
+    # create mapping from existing columns to standard names
+    mapping = {}
     mapping[sdf.columns[cols.index("name")]] = "name"
     mapping[sdf.columns[cols.index("gender")]] = "gender"
     mapping[sdf.columns[cols.index("age")]] = "age"
     mapping[sdf.columns[cols.index("city")]] = "city"
-    # if "medical_specialty" in cols:
     mapping[sdf.columns[cols.index("medical_specialty")]] = "medical_specialty"
-    # if "transcription" in cols:
     mapping[sdf.columns[cols.index("transcription")]] = "text"
-    # elif "sample" in cols:
-    # mapping[sdf.columns[cols.index("sample_name")]] = "text"
-    # else:
-        # fallback: use first textual column
-        # mapping[sdf.columns[0]] = "text"
 
+    # select and rename
     sdf = sdf.select([F.col(k).alias(v) for k, v in mapping.items()])
-    sdf = sdf.withColumn("text", F.col("text").cast(T.StringType()))
 
-    # df = sdf.toPandas()
-    # df.to_csv("debug_mtsamples_raw.csv", index=False)
-    
+    # cast text to string and clean
+    sdf = sdf.withColumn("text", F.col("text").cast(T.StringType()))
     sdf = sdf.withColumn("text", F.udf(clean_text, T.StringType())("text"))
+
+    # drop rows with null text
     sdf = sdf.na.drop(subset=["text"])
     pdf = sdf.toPandas()
+
+    #combine medical specialty with text (makes unique)
+    pdf["text"] = pdf.apply(lambda x: f"{x['medical_specialty']}, {x['text']}" if pd.notnull(x['medical_specialty']) else x['text'], axis=1)
+
+    # pdf.to_csv("debug_mtsamples_cleaned.csv", index=False)
     pdf = pdf.drop_duplicates(subset=["text"]).reset_index(drop=True)
+    print(f"Rows after preprocessing: {pdf.shape}")
+
     return pdf
 
 
