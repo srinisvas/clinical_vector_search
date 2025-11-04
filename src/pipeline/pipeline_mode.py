@@ -157,46 +157,39 @@ def mode_fhe(args):
 
 def mode_rag(args):
     spark = build_spark()
-    pdf = load_mtsamples_df(spark, args.data_path)
-    print(f"Loaded rows: {len(pdf)}")
-
-    # Embeddings
-    model = SentenceTransformer(args.model)
-    vecs = model.encode(pdf["text"].tolist(), batch_size=32, show_progress_bar=True)
-    vecs = normalize_rows(vecs.astype(np.float32))
-    pdf["vec"] = list(vecs)
-
-    # Index: HNSW for speed
+    data_path = args.data_path
+    pdf = load_mtsamples_df(spark, data_path)
+    pdf = build_embeddings_with_spark(pdf, args.model)
+    vecs = np.vstack(pdf["vec"].values).astype(np.float32)
     index = build_faiss_index(vecs, args.index_path, hnsw=True, hnsw_M=args.hnsw_M, efC=args.efC)
-    # At search time, you can set efSearch:
-    try:
-        index.hnsw.efSearch = args.efS
-    except Exception:
-        pass
-    print(f"HNSW index saved: {args.index_path}")
 
-    # Query
-    if not args.query:
-        args.query = "post-operative knee arthroscopy pain management"
+    if args.query:
+        # Load index and embeddings
+        index = faiss.read_index(args.index_path)
+        model = SentenceTransformer(args.model)
 
-    qv = model.encode([args.query])
-    qv = normalize_rows(qv.astype(np.float32))
-    Dv, Iv = search_faiss(index, qv, k=args.candidate_k)  # vector candidates
+        # Prepare query embedding
+        qv = model.encode([args.query])
+        qv = normalize_rows(qv.astype(np.float32))
 
-    # Hybrid (optional BM25)
-    if args.enable_hybrid:
-        bm_idx = bm25_topk(pdf["text"].tolist(), args.query, topk=args.bm25_topk)
-        # Union of candidates
-        cand_set = set(bm_idx) | set(Iv[0].tolist())
-        cand_ids = list(cand_set)
-    else:
+        # Vector-based candidate retrieval
+        Dv, Iv = search_faiss(index, qv, k=args.candidate_k)
         cand_ids = Iv[0].tolist()
 
-    cand_vecs = vecs[cand_ids]
-    # MMR re-rank
-    final_ids = mmr_rerank(qv.ravel(), cand_vecs, cand_ids, k=args.topk, lambda_param=args.mmr_lambda)
+        # Optional: Hybrid lexical retrieval using BM25
+        if args.enable_hybrid:
+            bm_idx = bm25_topk(pdf["text"].tolist(), args.query, topk=args.bm25_topk)
+            cand_set = set(bm_idx) | set(cand_ids)
+            cand_ids = list(cand_set)
 
-    print(f"\n[RAG] Query: {args.query}")
-    for rank, idx in enumerate(final_ids):
-        text = pdf.iloc[idx]["text"][:220].replace("\n", " ")
-        print(f"{rank+1:>2}. :: {text}...")
+        # MMR re-ranking for diversity and contextual relevance
+        vecs = np.vstack(pdf["vec"].values).astype(np.float32)
+        cand_vecs = vecs[cand_ids]
+        final_ids = mmr_rerank(qv.ravel(), cand_vecs, cand_ids,
+                               k=args.topk, lambda_param=args.mmr_lambda)
+
+        # Display results
+        print(f"\n[Optimized RAG] Query: {args.query}")
+        for rank, idx in enumerate(final_ids):
+            snippet = pdf.iloc[idx]["text"][:200].replace("\n", " ")
+            print(f"{rank+1:>2}. score{Dv[0][0]:.4f} :: {snippet}...")
