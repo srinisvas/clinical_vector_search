@@ -1,33 +1,51 @@
 import math
+import sys
+import os
 
 import numpy as np
 from pyspark.sql import SparkSession, functions as F, types as T
 from scipy.special._precompute.cosine_cdf import ts
+from sentence_transformers import SentenceTransformer 
+import faiss
 
-from src.pipeline.embedding import build_spark, add_noise_vec
-from src.pipeline.pipeline import load_mtsamples_df, build_embeddings_with_spark, build_faiss_index, search_faiss, \
-    bm25_topk
-from src.utils.utils import normalize_rows, mmr_rerank, timer, norm_vec
+from pipeline.embedding import build_spark, add_noise_vec
+from pipeline.pipeline import (load_mtsamples_df, 
+                               build_embeddings_with_spark,
+                               build_faiss_index, 
+                               search_faiss)
+                            #    bm25_topk)
+from pipeline.utils import (normalize_rows, 
+                            mmr_rerank, 
+                            timer, 
+                            norm_vec)
 
 
 def mode_baseline(args):
+
     spark = build_spark()
-    pdf = load_mtsamples_df(spark, args.data_path)
+
+    data_path = args.data_path
+    pdf = load_mtsamples_df(spark, data_path)
     print(f"Loaded rows: {len(pdf)}")
 
     pdf = build_embeddings_with_spark(pdf, args.model)
-    vecs = np.vstack(pdf["vec"].values).astype(np.float32)
 
-    index = build_faiss_index(vecs, args.index_path, hnsw=False)
-    print(f"Baseline FAISS (FlatIP) index saved: {args.index_path}")
+    if not args.query:
+
+        vecs = np.vstack(pdf["vec"].values).astype(np.float32)
+        index = build_faiss_index(vecs, args.index_path, hnsw=False)
+        print(f"Baseline FAISS (FlatIP) index saved: {args.index_path}")
 
     # quick demo query
     if args.query:
+
+        index = faiss.read_index(args.index_path)
         q_model = SentenceTransformer(args.model)
         qv = q_model.encode([args.query])
         qv = normalize_rows(qv.astype(np.float32))
         D, I = search_faiss(index, qv, k=args.topk)
         print(f"\nQuery: {args.query}")
+        
         for rank, idx in enumerate(I[0]):
             text = pdf.iloc[idx]["text"][:200].replace("\n", " ")
             print(f"{rank+1:>2}. score={D[0][rank]:.4f} :: {text}...")
@@ -64,9 +82,9 @@ def mode_dp(args):
 
 
 def mode_fhe(args):
-    if not HAS_TENSEAL:
-        print("TenSEAL not installed. `pip install tenseal` to run FHE POC.")
-        sys.exit(1)
+    # if not HAS_TENSEAL:
+    #     print("TenSEAL not installed. `pip install tenseal` to run FHE POC.")
+    #     sys.exit(1)
 
     spark = build_spark()
     pdf = load_mtsamples_df(spark, args.data_path)
