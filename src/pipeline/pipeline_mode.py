@@ -51,34 +51,54 @@ def mode_baseline(args):
 
 
 def mode_dp(args):
+
     spark = build_spark()
-    pdf = load_mtsamples_df(spark, args.data_path)
-    print(f"Loaded rows: {len(pdf)}")
+    data_path = args.data_path
+    pdf = load_mtsamples_df(spark, data_path)
 
     pdf = build_embeddings_with_spark(pdf, args.model)
-    pdf["vec_dp"] = [add_noise_vec(v, args.sigma) for v in pdf["vec"]]
-    vecs_dp = np.vstack(pdf["vec_dp"].values).astype(np.float32)
+    text_vecs = np.vstack(pdf["vec"].values).astype(np.float32)
 
-    index = build_faiss_index(vecs_dp, args.index_path, hnsw=False)
-    print(f"DP FAISS (FlatIP) index saved (sigma={args.sigma}): {args.index_path}")
+    model = SentenceTransformer(args.model)
+    attr_texts = [
+        f"{n} {g} {a} {c}"
+        for n, g, a, c in zip(pdf["Name"], pdf["Gender"], pdf["Age"], pdf["City"])
+    ]
+    print("Encoding sensitive attribute vectors and applying DP noise ...")
+    attr_vecs = model.encode(attr_texts, batch_size=32, show_progress_bar=True)
+    attr_vecs = normalize_rows(np.array(attr_vecs, dtype=np.float32))
 
-    # simple comparison if query provided
+    sigma = args.sigma
+    noise = np.random.normal(0, sigma, attr_vecs.shape).astype(np.float32)
+    attr_vecs_noisy = attr_vecs + noise
+    attr_vecs_noisy = normalize_rows(attr_vecs_noisy)
+
+    final_vecs = np.hstack([
+        text_vecs * 0.9,  # main clinical semantics
+        attr_vecs_noisy * 0.1  # privacy-protected identifiers
+    ])
+    final_vecs = normalize_rows(final_vecs)
+
+    index = build_faiss_index(final_vecs, args.index_path, hnsw=False)
+    print(f"DP FAISS index (attribute-level DP, σ={sigma}) saved at {args.index_path}")
+
     if args.query:
-        model = SentenceTransformer(args.model)
-        qv = model.encode([args.query])
-        qv = normalize_rows(qv.astype(np.float32))
-        D, I = search_faiss(index, qv, k=args.topk)
-        print(f"\n[DP] Query: {args.query}")
-        for rank, idx in enumerate(I[0]):
-            text = pdf.iloc[idx]["text"][:200].replace("\n", " ")
-            print(f"{rank+1:>2}. score={D[0][rank]:.4f} :: {text}...")
-    # optional: save a small CSV of (sigma, vec_cos_drop)
-    # measure average cosine between clean and noisy vecs
-    cos = []
-    for v_clean, v_noisy in zip(pdf["vec"].values, pdf["vec_dp"].values):
-        cos.append(float(np.dot(v_clean, v_noisy)))
-    print(f"Avg cosine(clean,noisy) @ sigma={args.sigma}: {np.mean(cos):.4f}")
+        model_q = SentenceTransformer(args.model)
+        qv_text = model_q.encode([args.query])
+        qv_text = normalize_rows(qv_text.astype(np.float32))
+        # No sensitive fields in queries — zero-vector placeholder
+        qv_attr = np.zeros_like(attr_vecs_noisy[0])
+        qv_combined = np.hstack([qv_text * 0.9, qv_attr * 0.1])
+        qv_combined = normalize_rows(qv_combined)
 
+        D, I = search_faiss(index, qv_combined, k=args.topk)
+        print(f"\n[DP-Attribute] Query: {args.query}")
+        for rank, idx in enumerate(I[0]):
+            snippet = pdf.iloc[idx]["text"][:200].replace("\n", " ")
+            print(f"{rank+1:>2}. score={D[0][rank]:.4f} :: {snippet}...")
+
+    cos_attr = [float(np.dot(a, b)) for a, b in zip(attr_vecs, attr_vecs_noisy)]
+    print(f"Average cosine(attribute clean,noisy) @ σ={sigma}: {np.mean(cos_attr):.4f}")
 
 def mode_fhe(args):
     # if not HAS_TENSEAL:
