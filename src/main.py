@@ -1,6 +1,8 @@
 import argparse
+import sys
 
-from src.pipeline.pipeline_mode import mode_baseline, mode_dp, mode_fhe, mode_rag
+# sys.path.append(".")
+from pipeline.pipeline_mode import mode_baseline, mode_dp, mode_fhe, mode_rag
 
 def parse_args():
     p = argparse.ArgumentParser(description="Privacy-Preserving Vector-Based Semantic Search for Clinical Text")
@@ -8,9 +10,9 @@ def parse_args():
                    help="Which track to run.")
     p.add_argument("--data_path", required=True, help="Path to MTSamples CSV (medical_transcriptions.csv).")
     p.add_argument("--index_path", default="./faiss_mtsamples.faiss", help="Where to save FAISS index.")
-    p.add_argument("--model", default="all-MiniLM-L6-v2", help="Sentence-Transformers model (try: 'pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb').")
+    p.add_argument("--model", default="sentence-transformers/all-MiniLM-L6-v2", help="Sentence-Transformers model (try: 'pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb').")
     p.add_argument("--topk", type=int, default=10, help="Top-k results to return.")
-    p.add_argument("--query", type=str, default="", help="Optional test query.")
+    p.add_argument("--query", type=str, default="", help="Optional test query. use only after index is built.")
     # DP
     p.add_argument("--sigma", type=float, default=0.15, help="Gaussian noise stddev for DP mode.")
     # FHE
