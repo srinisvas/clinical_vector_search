@@ -3,7 +3,7 @@ from sentence_transformers import SentenceTransformer
 from typing import List, Optional
 import numpy as np
 
-from pipeline.utils import normalize_rows
+from pipeline.utils import normalize_rows, norm_vec
 
 def build_spark(app_name="ClinicalVectorSearch"):
 

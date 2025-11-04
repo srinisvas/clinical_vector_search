@@ -11,7 +11,7 @@ COPY src/dataset/medical_transcriptions.csv /app/dataset/
 # ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
 # Custom logging
-COPY log4j2.properties /opt/bitnami/spark/conf/log4j2.properties
+# COPY log4j2.properties /opt/bitnami/spark/conf/log4j2.properties
 
 # copy requirements file and install python dependencies
 COPY requirements.txt /app/
@@ -21,7 +21,7 @@ RUN pip install -r requirements.txt
 ENV PYTHONPATH="/app/src:${PYTHONPATH}"
 
 # Set a writable cache directory for huggingface transformers
-ENV TRANSFORMERS_CACHE=/app/.cache/huggingface
+# ENV TRANSFORMERS_CACHE=/app/.cache/huggingface
 ENV HF_HOME=/app/.cache/huggingface
 RUN mkdir -p /app/.cache/huggingface && chmod -R 777 /app/.cache
 

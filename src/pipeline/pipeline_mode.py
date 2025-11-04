@@ -26,7 +26,6 @@ def mode_baseline(args):
 
     data_path = args.data_path
     pdf = load_mtsamples_df(spark, data_path)
-    print(f"Loaded rows: {len(pdf)}")
 
     pdf = build_embeddings_with_spark(pdf, args.model)
 
