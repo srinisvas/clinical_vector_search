@@ -1,24 +1,43 @@
+import pandas as pd
+import numpy as np
+from pyspark.sql import SparkSession, functions as F, types as T
+from sentence_transformers import SentenceTransformer
 import faiss
-from rank_bm25 import BM25Okapi
+# from rank_bm25 import BM25Okapi
+from typing import List, Tuple
+import os
+
+from pipeline.utils import normalize_rows, clean_text
 
 def load_mtsamples_df(spark, data_path: str) -> pd.DataFrame:
-    # MTSamples common columns: "medical_specialty", "transcription", (sometimes "description")
+
+    # import pdb; pdb.set_trace()
     sdf = spark.read.csv(data_path, header=True, multiLine=True, escape='"')
     # normalize column names we care about
     cols = [c.lower() for c in sdf.columns]
+    print("sdf cols", cols)
     mapping = {}
-    if "medical_specialty" in cols:
-        mapping[sdf.columns[cols.index("medical_specialty")]] = "medical_specialty"
-    if "transcription" in cols:
-        mapping[sdf.columns[cols.index("transcription")]] = "text"
-    elif "sample" in cols:
-        mapping[sdf.columns[cols.index("sample")]] = "text"
-    else:
+
+    mapping[sdf.columns[cols.index("name")]] = "name"
+    mapping[sdf.columns[cols.index("gender")]] = "gender"
+    mapping[sdf.columns[cols.index("age")]] = "age"
+    mapping[sdf.columns[cols.index("city")]] = "city"
+    # if "medical_specialty" in cols:
+    mapping[sdf.columns[cols.index("medical_specialty")]] = "medical_specialty"
+    # if "transcription" in cols:
+    mapping[sdf.columns[cols.index("transcription")]] = "text"
+    # elif "sample" in cols:
+    # mapping[sdf.columns[cols.index("sample_name")]] = "text"
+    # else:
         # fallback: use first textual column
-        mapping[sdf.columns[0]] = "text"
+        # mapping[sdf.columns[0]] = "text"
 
     sdf = sdf.select([F.col(k).alias(v) for k, v in mapping.items()])
     sdf = sdf.withColumn("text", F.col("text").cast(T.StringType()))
+
+    # df = sdf.toPandas()
+    # df.to_csv("debug_mtsamples_raw.csv", index=False)
+    
     sdf = sdf.withColumn("text", F.udf(clean_text, T.StringType())("text"))
     sdf = sdf.na.drop(subset=["text"])
     pdf = sdf.toPandas()
@@ -53,11 +72,11 @@ def search_faiss(index, query_vec: np.ndarray, k: int = 10) -> Tuple[np.ndarray,
     return D, I
 
 
-def bm25_topk(corpus_texts: List[str], query: str, topk: int = 100) -> List[int]:
-    if not HAS_BM25:
-        return list(range(0, min(topk, len(corpus_texts))))
-    tokenized = [t.lower().split() for t in corpus_texts]
-    bm25 = BM25Okapi(tokenized)
-    scores = bm25.get_scores(query.lower().split())
-    idx = np.argsort(scores)[::-1][:topk].tolist()
-    return idx
+# def bm25_topk(corpus_texts: List[str], query: str, topk: int = 100) -> List[int]:
+#     if not HAS_BM25:
+#         return list(range(0, min(topk, len(corpus_texts))))
+#     tokenized = [t.lower().split() for t in corpus_texts]
+#     bm25 = BM25Okapi(tokenized)
+#     scores = bm25.get_scores(query.lower().split())
+#     idx = np.argsort(scores)[::-1][:topk].tolist()
+#     return idx
