@@ -1,9 +1,10 @@
 import pandas as pd
 import numpy as np
 from pyspark.sql import SparkSession, functions as F, types as T
+from time import time
 from sentence_transformers import SentenceTransformer
 import faiss
-# from rank_bm25 import BM25Okapi
+from rank_bm25 import BM25Okapi
 from typing import List, Tuple
 import os
 
@@ -11,6 +12,7 @@ from pipeline.utils import normalize_rows, clean_text
 
 def load_mtsamples_df(spark, data_path: str) -> pd.DataFrame:
 
+    spark_start_time = time()
     # import pdb; pdb.set_trace()
     sdf = spark.read.csv(data_path, header=True, multiLine=True, escape='"')
     print(f"Rows Loaded: {sdf.count()}")
@@ -43,18 +45,26 @@ def load_mtsamples_df(spark, data_path: str) -> pd.DataFrame:
 
     # pdf.to_csv("debug_mtsamples_cleaned.csv", index=False)
     pdf = pdf.drop_duplicates(subset=["text"]).reset_index(drop=True)
+    spark_tat = round((time() - spark_start_time) * 1000.0, 2)
     print(f"Rows after preprocessing: {pdf.shape}")
+    print(f"Spark load and preprocess time: {spark_tat} ms")
+
 
     return pdf
 
 
-def build_embeddings_with_spark(pdf: pd.DataFrame, model_name: str, batch_col: str = "text") -> pd.DataFrame:
+def build_embeddings_with_spark(pdf: pd.DataFrame, model_name: str, save_path: str = None, batch_col: str = "text") -> pd.DataFrame:
     # Use local (driver) batching to avoid serializing models to workers (simpler & reliable for 5k–50k docs)
     # If you need true distributed inference, convert to RDD partitions and call embed_partition.
     model = SentenceTransformer(model_name)
     vecs = model.encode(pdf[batch_col].tolist(), batch_size=32, show_progress_bar=True)
     vecs = normalize_rows(np.array(vecs, dtype=np.float32))
     pdf["vec"] = list(vecs)
+
+    if save_path:
+        print(f"Saving embeddings to: {save_path}")
+        pdf.to_parquet(save_path, index=False)
+
     return pdf
 
 
@@ -75,11 +85,11 @@ def search_faiss(index, query_vec: np.ndarray, k: int = 10) -> Tuple[np.ndarray,
     return D, I
 
 
-# def bm25_topk(corpus_texts: List[str], query: str, topk: int = 100) -> List[int]:
-#     if not HAS_BM25:
-#         return list(range(0, min(topk, len(corpus_texts))))
-#     tokenized = [t.lower().split() for t in corpus_texts]
-#     bm25 = BM25Okapi(tokenized)
-#     scores = bm25.get_scores(query.lower().split())
-#     idx = np.argsort(scores)[::-1][:topk].tolist()
-#     return idx
+def bm25_topk(corpus_texts: List[str], query: str, topk: int = 100) -> List[int]:
+    # if not HAS_BM25:
+    #     return list(range(0, min(topk, len(corpus_texts))))
+    tokenized = [t.lower().split() for t in corpus_texts]
+    bm25 = BM25Okapi(tokenized)
+    scores = bm25.get_scores(query.lower().split())
+    idx = np.argsort(scores)[::-1][:topk].tolist()
+    return idx
