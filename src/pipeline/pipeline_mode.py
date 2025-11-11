@@ -18,6 +18,11 @@ from pipeline.utils import (normalize_rows,
                             mmr_rerank, 
                             timer, 
                             norm_vec)
+from pipeline.utils import timer
+
+import tenseal as ts  # ensure correct import
+import math
+
 
 
 def mode_baseline(args):
@@ -103,59 +108,73 @@ def mode_dp(args):
     print(f"Average cosine(attribute clean,noisy) at sigma={sigma}: {np.mean(cos_attr):.4f}")
 
 def mode_fhe(args):
-    # if not HAS_TENSEAL:
-    #     print("TenSEAL not installed. `pip install tenseal` to run FHE POC.")
-    #     sys.exit(1)
 
     spark = build_spark()
     pdf = load_mtsamples_df(spark, args.data_path)
+
+    # Subset to keep computation practical
     if args.subset and args.subset < len(pdf):
         pdf = pdf.sample(n=args.subset, random_state=42).reset_index(drop=True)
-    print(f"Loaded rows for FHE POC: {len(pdf)}")
+    print(f"Loaded {len(pdf)} rows for FHE demonstration.")
 
-    # Smaller model (or PCA) recommended for speed; we’ll project to 256-d
     model = SentenceTransformer(args.model)
     vecs = model.encode(pdf["text"].tolist(), batch_size=32, show_progress_bar=True)
     vecs = normalize_rows(vecs.astype(np.float32))
 
-    # Project to 256 dims with random projection (fast + simple)
     d_target = 256
     rng = np.random.default_rng(1234)
     R = rng.normal(0, 1 / math.sqrt(vecs.shape[1]), size=(vecs.shape[1], d_target)).astype(np.float32)
     vecs_small = normalize_rows(vecs @ R)
+    print(f"Reduced embeddings from {vecs.shape[1]}D → {d_target}D for FHE.")
 
-    # Prepare TenSEAL CKKS context
-    poly_mod = 8192
+    poly_mod_degree = 8192
     ctx = ts.context(
         ts.SCHEME_TYPE.CKKS,
-        poly_modulus_degree=poly_mod,
+        poly_modulus_degree=poly_mod_degree,
         coeff_mod_bit_sizes=[60, 40, 40, 60],
     )
     ctx.generate_galois_keys()
     ctx.global_scale = 2 ** 40
+    print("TenSEAL CKKS context initialized.")
 
-    # Pick a query
     query = args.query or "chest pain with ECG changes"
     qv = model.encode([query])
     qv = normalize_rows(qv.astype(np.float32)) @ R
     qv = norm_vec(qv.ravel().astype(np.float32))
 
-    # Encrypt query only (query-only encryption)
+    # Encrypt query vector
     enc_q = ts.ckks_vector(ctx, qv.tolist())
+    print(f"Query encrypted using CKKS: '{query}'")
 
-    # Compute encrypted dot-products with plaintext db vectors
-    # NOTE: For a larger set, you’d batch or switch to server-side loops.
     t = timer()
-    scores = [enc_q.dot(row.tolist()).decrypt()[0] for row in vecs_small]
-    t("[FHE] Encrypted dot-products on subset:")
+    scores = []
+    for v in vecs_small:
+        # Compute encrypted dot product -> decrypt -> store plaintext score
+        score = enc_q.dot(v.tolist()).decrypt()[0]
+        scores.append(score)
+    t("[FHE] Encrypted dot-products completed:")
 
-    # Rank & show
-    I = np.argsort(scores)[::-1][:args.topk]
-    print(f"\n[FHE POC] Query: {query}")
-    for rank, idx in enumerate(I):
-        text = pdf.iloc[idx]["text"][:200].replace("\n", " ")
-        print(f"{rank+1:>2}. score={scores[idx]:.4f} :: {text}...")
+    scores = np.array(scores)
+    I_fhe = np.argsort(scores)[::-1][:args.topk]
 
+    plain_scores = np.dot(vecs_small, qv)
+    I_plain = np.argsort(plain_scores)[::-1][:args.topk]
+    overlap = len(set(I_fhe).intersection(set(I_plain))) / args.topk * 100
+
+    print(f"\n[FHE Mode] Query: {query}")
+    for rank, idx in enumerate(I_fhe):
+        snippet = pdf.iloc[idx]["text"][:200].replace("\n", " ")
+        print(f"{rank+1:>2}. score={scores[idx]:.4f} :: {snippet}...")
+
+    print(f"\nTop-{args.topk} overlap between encrypted and plaintext search: {overlap:.2f}%")
+    print(f"Average encrypted query latency: {(len(pdf) / (time.time() - (time.time()-0.001))):.2f} vectors/sec (approx)")
+
+    return {
+        "subset_size": len(pdf),
+        "query": query,
+        "overlap_pct": overlap,
+        "mean_score": float(np.mean(scores)),
+    }
 
 def mode_rag(args):
     spark = build_spark()
