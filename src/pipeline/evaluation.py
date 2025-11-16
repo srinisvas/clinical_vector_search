@@ -6,11 +6,14 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sentence_transformers import SentenceTransformer
 import faiss
-
-from pipeline.pipeline import search_faiss
-from pipeline.utils import normalize_rows, norm_vec
 import tenseal as ts
 
+from pipeline.utils import normalize_rows, norm_vec
+
+
+# -------------------------------------------------------
+# Configuration
+# -------------------------------------------------------
 
 QUERIES = [
     "post-operative knee arthroscopy pain management",
@@ -35,8 +38,9 @@ os.makedirs(PLOTS_DIR, exist_ok=True)
 
 def run_timed(func, *args, **kwargs):
     start = time.time()
-    res = func(*args, **kwargs)
-    return res, (time.time() - start) * 1000.0
+    result = func(*args, **kwargs)
+    elapsed_ms = (time.time() - start) * 1000.0
+    return result, elapsed_ms
 
 
 def recall_at_k(base, other):
@@ -48,13 +52,11 @@ def precision_at_k(base, other):
 
 
 def accuracy_at_k(base, other):
-    # Hit rate: proportion of exact matches
     matches = sum(1 for a, b in zip(base, other) if a == b)
     return matches / len(base)
 
 
 def mrr(base, other):
-    # Rank position of first baseline item in other ranking
     for rank, doc_id in enumerate(other, start=1):
         if doc_id in base:
             return 1.0 / rank
@@ -66,98 +68,107 @@ def mrr(base, other):
 # -------------------------------------------------------
 
 def benchmark_all(data_path, model_name, index_paths):
+    print("\nLoading model...")
     model = SentenceTransformer(model_name)
+
+    print("\nLoading embeddings parquet...")
+    pdf = pd.read_parquet("embeddings.parquet")
+    vecs = np.vstack(pdf["vec"].values).astype(np.float32)
+
+    print("\nLoading Baseline FAISS index...")
+    baseline_index = faiss.read_index(index_paths["baseline"])
+
+    print("Loading DP index...")
+    dp_index = faiss.read_index(index_paths["dp"])
+
+    print("\nRebuilding RAG HNSW index in-memory (macOS safe)...")
+    d = vecs.shape[1]
+    rag_index = faiss.IndexHNSWFlat(d, 32)
+    rag_index.hnsw.efConstruction = 200
+    rag_index.add(vecs)
+    rag_index.hnsw.efSearch = 128
+
+    fhe_subset = 100  # small, fast, POC FHE
+
     results = []
 
-    # Load prebuilt indexes
-    baseline_index = faiss.read_index(index_paths["baseline"])
-    dp_index = faiss.read_index(index_paths["dp"])
-    rag_index = faiss.read_index(index_paths["rag"])
-
-    fhe_subset = 200
-
     for query in QUERIES:
-        print(f"\nEvaluating query: '{query}'")
+        print(f"\n----------------------------------------------")
+        print(f"Evaluating query: '{query}'")
+
+        # Encode query
         qv = model.encode([query])
         qv = normalize_rows(qv.astype(np.float32))
 
         # ------------------ Baseline ------------------
-        (_, lat_base) = run_timed(search_faiss, baseline_index, qv, 10)
-        D_base, I_base = search_faiss(baseline_index, qv, 10)
+        (_, lat_base) = run_timed(baseline_index.search, qv, 10)
+        _, I_base = baseline_index.search(qv, 10)
         base_ids = I_base[0]
 
         # ------------------ DP Mode ------------------
-        d = dp_index.d
+        dp_dim = dp_index.d
         text_dim = qv.shape[1]
-        attr_dim = d - text_dim
-        qv_attr = np.zeros((1, attr_dim), dtype=np.float32)
-        qv_combined = np.hstack([qv * 0.7, qv_attr * 0.3])
-        qv_combined = normalize_rows(qv_combined)
+        attr_dim = dp_dim - text_dim
 
-        (_, lat_dp) = run_timed(search_faiss, dp_index, qv_combined, 10)
-        D_dp, I_dp = search_faiss(dp_index, qv_combined, 10)
+        qv_attr = np.zeros((1, attr_dim), dtype=np.float32)
+        qv_dp = normalize_rows(np.hstack([qv * 0.7, qv_attr * 0.3]))
+
+        (_, lat_dp) = run_timed(dp_index.search, qv_dp, 10)
+        _, I_dp = dp_index.search(qv_dp, 10)
         dp_ids = I_dp[0]
 
-        # ------------------ FHE Mode ------------------
+        # ------------------ FHE Mode (synthetic) ------------------
         d_target = 256
-        rng = np.random.default_rng(1234)
-        R = rng.normal(0, 1 / np.sqrt(qv.shape[1]), size=(qv.shape[1], d_target)).astype(np.float32)
+        R = np.random.normal(0, 1 / np.sqrt(qv.shape[1]), size=(qv.shape[1], d_target)).astype(np.float32)
+
         qv_small = normalize_rows(qv @ R)
         qv_small = norm_vec(qv_small.ravel().astype(np.float32))
 
-        vecs = np.random.randn(fhe_subset, qv_small.shape[0]).astype(np.float32)
-        vecs = normalize_rows(vecs)
+        vecs_small = np.random.randn(fhe_subset, d_target).astype(np.float32)
+        vecs_small = normalize_rows(vecs_small)
 
-        ctx = ts.context(ts.SCHEME_TYPE.CKKS,
-                         poly_modulus_degree=8192,
-                         coeff_mod_bit_sizes=[60, 40, 40, 60])
+        ctx = ts.context(
+            ts.SCHEME_TYPE.CKKS,
+            poly_modulus_degree=8192,
+            coeff_mod_bit_sizes=[60, 40, 40, 60]
+        )
         ctx.generate_galois_keys()
-        ctx.global_scale = 2**40
+        ctx.global_scale = 2 ** 40
+
         enc_q = ts.ckks_vector(ctx, qv_small.tolist())
 
         fhe_scores = []
         t0 = time.time()
-        for v in vecs:
+        for v in vecs_small:
             fhe_scores.append(enc_q.dot(v.tolist()).decrypt()[0])
         lat_fhe = (time.time() - t0) * 1000.0
-
-        # We have no faiss index so use synthetic top-k
         fhe_ids = np.argsort(fhe_scores)[::-1][:10]
 
-        # ------------------ RAG (HNSW) ------------------
-        (_, lat_rag) = run_timed(search_faiss, rag_index, qv, 10)
-        D_rag, I_rag = search_faiss(rag_index, qv, 10)
+        # ------------------ RAG (HNSW Accurate) ------------------
+        (_, lat_rag) = run_timed(rag_index.search, qv, 10)
+        _, I_rag = rag_index.search(qv, 10)
         rag_ids = I_rag[0]
 
-        # -------------------------------------------------------
-        # Compute final 5 metrics
-        # -------------------------------------------------------
-
+        # ------------------ Metrics ------------------
         results.append({
             "query": query,
-
-            # Latency
             "baseline_latency_ms": lat_base,
             "dp_latency_ms": lat_dp,
             "fhe_latency_ms": lat_fhe,
             "rag_latency_ms": lat_rag,
 
-            # Recall
             "dp_recall": recall_at_k(base_ids, dp_ids),
             "fhe_recall": recall_at_k(base_ids, fhe_ids),
             "rag_recall": recall_at_k(base_ids, rag_ids),
 
-            # Precision
             "dp_precision": precision_at_k(base_ids, dp_ids),
             "fhe_precision": precision_at_k(base_ids, fhe_ids),
             "rag_precision": precision_at_k(base_ids, rag_ids),
 
-            # Accuracy / Hit Rate
             "dp_accuracy": accuracy_at_k(base_ids, dp_ids),
             "fhe_accuracy": accuracy_at_k(base_ids, fhe_ids),
             "rag_accuracy": accuracy_at_k(base_ids, rag_ids),
 
-            # MRR
             "dp_mrr": mrr(base_ids, dp_ids),
             "fhe_mrr": mrr(base_ids, fhe_ids),
             "rag_mrr": mrr(base_ids, rag_ids),
@@ -165,7 +176,7 @@ def benchmark_all(data_path, model_name, index_paths):
 
     df = pd.DataFrame(results)
     df.to_csv("evaluation_results.csv", index=False)
-    print("Saved: evaluation_results.csv")
+    print("\nSaved evaluation_results.csv")
     return df
 
 
@@ -176,7 +187,6 @@ def benchmark_all(data_path, model_name, index_paths):
 def generate_plots(df):
     avg = df.mean(numeric_only=True)
 
-    # Latency bar chart
     plt.figure(figsize=(8, 5))
     modes = ["Baseline", "DP", "FHE", "RAG"]
     times = [
@@ -192,51 +202,19 @@ def generate_plots(df):
     plt.savefig(os.path.join(PLOTS_DIR, "latency_comparison.png"))
     plt.close()
 
-    # Recall comparison
-    plt.figure(figsize=(8, 5))
-    plt.plot(df["dp_recall"], label="DP", marker="o")
-    plt.plot(df["fhe_recall"], label="FHE", marker="o")
-    plt.plot(df["rag_recall"], label="RAG", marker="o")
-    plt.title("Recall@K vs Baseline")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(PLOTS_DIR, "recall.png"))
-    plt.close()
+    metrics = ["recall", "precision", "accuracy", "mrr"]
+    for m in metrics:
+        plt.figure(figsize=(8, 5))
+        plt.plot(df[f"dp_{m}"], marker="o", label="DP")
+        plt.plot(df[f"fhe_{m}"], marker="o", label="FHE")
+        plt.plot(df[f"rag_{m}"], marker="o", label="RAG")
+        plt.legend()
+        plt.title(f"{m.upper()} Comparison")
+        plt.tight_layout()
+        plt.savefig(os.path.join(PLOTS_DIR, f"{m}.png"))
+        plt.close()
 
-    # Precision comparison
-    plt.figure(figsize=(8, 5))
-    plt.plot(df["dp_precision"], label="DP", marker="o")
-    plt.plot(df["fhe_precision"], label="FHE", marker="o")
-    plt.plot(df["rag_precision"], label="RAG", marker="o")
-    plt.title("Precision@K vs Baseline")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(PLOTS_DIR, "precision.png"))
-    plt.close()
-
-    # Accuracy comparison
-    plt.figure(figsize=(8, 5))
-    plt.plot(df["dp_accuracy"], label="DP", marker="o")
-    plt.plot(df["fhe_accuracy"], label="FHE", marker="o")
-    plt.plot(df["rag_accuracy"], label="RAG", marker="o")
-    plt.title("Accuracy@K (Hit Rate)")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(PLOTS_DIR, "accuracy.png"))
-    plt.close()
-
-    # MRR comparison
-    plt.figure(figsize=(8, 5))
-    plt.plot(df["dp_mrr"], label="DP", marker="o")
-    plt.plot(df["fhe_mrr"], label="FHE", marker="o")
-    plt.plot(df["rag_mrr"], label="RAG", marker="o")
-    plt.title("MRR vs Baseline")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(PLOTS_DIR, "mrr.png"))
-    plt.close()
-
-    print("Plots saved.")
+    print("Saved plots to /plots/")
 
 
 # -------------------------------------------------------
@@ -250,7 +228,7 @@ def main():
     index_paths = {
         "baseline": "./faiss_mtsamples_baseline.faiss",
         "dp": "./faiss_mtsamples_dp.faiss",
-        "rag": "./faiss_mtsamples_rag.faiss",
+        "rag": "./faiss_mtsamples_rag_hnsw.faiss"  # not used directly
     }
 
     df = benchmark_all(data_path, model_name, index_paths)
