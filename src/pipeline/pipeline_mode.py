@@ -127,4 +127,127 @@ def mode_fhe(args):
 
     # Reduce dataset for FHE feasibility
     if args.subset and args.subset < len(pdf):
-        pdf = pdf.sample(n=args.subset, random_state=42).reset_ind
+        pdf = pdf.sample(n=args.subset, random_state=42).reset_index(drop=True)
+    print(f"Loaded {len(pdf)} rows for FHE mode.")
+
+    # Build embeddings
+    model = SentenceTransformer(args.model)
+    vecs = model.encode(pdf["text"].tolist(), batch_size=32, show_progress_bar=True)
+    vecs = normalize_rows(vecs.astype(np.float32))
+
+    # Dimensionality reduction (random projection)
+    d_target = 256
+    rng = np.random.default_rng(1234)
+    R = rng.normal(
+        0,
+        1 / math.sqrt(vecs.shape[1]),
+        size=(vecs.shape[1], d_target)
+    ).astype(np.float32)
+
+    vecs_small = normalize_rows(vecs @ R)
+    print(f"Reduced dim: {vecs.shape[1]} → {d_target}")
+
+    # TenSEAL CKKS
+    ctx = ts.context(
+        ts.SCHEME_TYPE.CKKS,
+        poly_modulus_degree=8192,
+        coeff_mod_bit_sizes=[60, 40, 40, 60],
+    )
+    ctx.global_scale = 2**40
+    ctx.generate_galois_keys()
+    print("TenSEAL CKKS initialized.")
+
+    # Query
+    query = args.query or "chest pain with ECG changes"
+    qv = model.encode([query])
+    qv = normalize_rows(qv.astype(np.float32)) @ R
+    qv = norm_vec(qv.ravel())
+
+    enc_q = ts.ckks_vector(ctx, qv.tolist())
+    print(f"Encrypted query: '{query}'")
+
+    # Compute encrypted dot products
+    t = timer()
+    scores = []
+    for v in vecs_small:
+        score = enc_q.dot(v.tolist()).decrypt()[0]
+        scores.append(score)
+    t("[FHE] encrypted dot-products")
+
+    scores = np.array(scores)
+    I_fhe = np.argsort(scores)[::-1][:args.topk]
+
+    # Compute plaintext reference
+    plain_scores = vecs_small @ qv
+    I_plain = np.argsort(plain_scores)[::-1][:args.topk]
+
+    overlap = len(set(I_fhe).intersection(set(I_plain))) / args.topk * 100
+
+    print(f"\n[FHE Mode] Query: {query}")
+    for rank, idx in enumerate(I_fhe):
+        snippet = pdf.iloc[idx]["text"][:200].replace("\n", " ")
+        print(f"{rank+1:>2}. score={scores[idx]:.4f} :: {snippet}...")
+
+    print(f"Top-{args.topk} overlap (FHE vs plain): {overlap:.2f}%")
+
+
+# ============================================================
+# OPTIMIZED RAG MODE
+# ============================================================
+
+def mode_rag(args):
+    """
+    Optimized RAG:
+    - HNSW FAISS
+    - Optional BM25 hybrid
+    - MMR re-ranking
+    """
+    spark = build_spark()
+
+    pdf = load_mtsamples_df(spark, args.data_path)
+    pdf = build_embeddings_with_spark(pdf, args.model)
+
+    vecs = np.vstack(pdf["vec"].values).astype(np.float32)
+    index = build_faiss_index(
+        vecs,
+        args.index_path,
+        hnsw=True,
+        hnsw_M=args.hnsw_M,
+        efC=args.efC,
+    )
+    print(f"HNSW FAISS index saved at: {args.index_path}")
+
+    if not args.query:
+        return
+
+    index = faiss.read_index(args.index_path)
+    model = SentenceTransformer(args.model)
+
+    # Encode query
+    qv = model.encode([args.query])
+    qv = normalize_rows(qv.astype(np.float32))
+
+    # Vector search candidates
+    D_vec, I_vec = search_faiss(index, qv, k=args.candidate_k, efSearch=args.efS)
+    cand_ids = list(I_vec[0])
+
+    # Hybrid lexical retrieval
+    if args.enable_hybrid:
+        bm_ids = bm25_topk(pdf["text"].tolist(), args.query, topk=args.bm25_topk)
+        cand_ids = list(set(cand_ids) | set(bm_ids))
+
+    # MMR re-ranking
+    cand_vecs = vecs[cand_ids]
+    final_ids = mmr_rerank(
+        qv.ravel(),
+        cand_vecs,
+        cand_ids,
+        k=args.topk,
+        lambda_param=args.mmr_lambda,
+    )
+
+    print(f"\n[Optimized RAG] Query: {args.query}")
+    for rank, idx in enumerate(final_ids):
+        snippet = pdf.iloc[idx]["text"][:200].replace("\n", " ")
+        score = np.dot(qv.ravel(), pdf.iloc[idx]["vec"])
+        print(f"{rank+1:>2}. score={score:.4f} :: {snippet}...")
