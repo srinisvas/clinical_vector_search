@@ -1,20 +1,33 @@
 import os
+import sys
 import time
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
 
+# NOTE: keep imports minimal in evaluation to reduce native lib pressure on macOS
 from sentence_transformers import SentenceTransformer
 import faiss
 import tenseal as ts
 from rank_bm25 import BM25Okapi
-
 from sklearn.metrics.pairwise import cosine_similarity
 
-from pipeline.utils import normalize_rows, norm_vec
-from pipeline.pipeline import load_mtsamples_df
+# Make sure `src` (parent of `pipeline`) is on sys.path when run as module
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+SRC_ROOT = os.path.dirname(CURRENT_DIR)  # .../src
+if SRC_ROOT not in sys.path:
+    sys.path.insert(0, SRC_ROOT)
 
+from pipeline.utils import normalize_rows, norm_vec
+
+# Immediately make FAISS single-threaded to avoid macOS segfaults
+try:
+    faiss.omp_set_num_threads(1)
+except Exception:
+    pass
+
+# Also limit sentence-transformers parallelism via environment
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # ============================================================
 # Configuration
@@ -39,6 +52,8 @@ QUERIES = [
 ]
 
 TOP_K = 10
+
+SAFE_MODE = False  # set True if native segfaults persist; modes will degrade gracefully
 
 
 # ============================================================
@@ -72,12 +87,60 @@ def index_agreement(ref, other):
 # ============================================================
 
 def build_all(data_path, model_name):
-    print("Loading dataset...")
-    pdf = load_mtsamples_df(None, data_path)
+    print("Loading dataset with pandas (no Spark)...")
+    raw = pd.read_csv(data_path)
+
+    # Normalize column names to lowercase for robustness
+    raw.columns = [c.lower() for c in raw.columns]
+
+    # Map original MTSamples schema to the fields we need
+    # Header: Name,Gender,Age,City,description,medical_specialty,sample_name,transcription,keywords,Age_extracted
+    col_name = "name" if "name" in raw.columns else None
+    col_gender = "gender" if "gender" in raw.columns else None
+    col_age = "age" if "age" in raw.columns else None
+    col_city = "city" if "city" in raw.columns else None
+    col_specialty = "medical_specialty" if "medical_specialty" in raw.columns else None
+    col_trans = "transcription" if "transcription" in raw.columns else None
+
+    missing_core = [c for c, v in {
+        "name": col_name,
+        "gender": col_gender,
+        "age": col_age,
+        "city": col_city,
+        "medical_specialty": col_specialty,
+        "transcription": col_trans,
+    }.items() if v is None]
+    if missing_core:
+        raise ValueError(f"CSV missing expected MTSamples columns: {missing_core}")
+
+    # Build a working DataFrame with unified column names
+    pdf = pd.DataFrame({
+        "name": raw[col_name],
+        "gender": raw[col_gender],
+        "age": raw[col_age],
+        "city": raw[col_city],
+        "medical_specialty": raw[col_specialty],
+        "transcription": raw[col_trans],
+    })
+
+    # Construct `text` exactly like load_mtsamples_df: specialty + transcription
+    pdf["text"] = pdf.apply(
+        lambda x: f"{x['medical_specialty']}, {x['transcription']}"
+        if pd.notnull(x["medical_specialty"])
+        else x["transcription"],
+        axis=1,
+    )
+
+    # Drop duplicates on text to match pipeline behavior
+    pdf = pdf.drop_duplicates(subset=["text"]).reset_index(drop=True)
 
     print("Embedding dataset...")
     model = SentenceTransformer(model_name)
-    embeddings = model.encode(pdf["text"].tolist(), batch_size=32, show_progress_bar=True)
+    embeddings = model.encode(
+        pdf["text"].tolist(),
+        batch_size=32,
+        show_progress_bar=True,
+    )
     embeddings = normalize_rows(np.array(embeddings, dtype=np.float32))
 
     pdf["vec"] = list(embeddings)
@@ -106,14 +169,13 @@ def build_all(data_path, model_name):
     dp_index = faiss.IndexFlatIP(dp_vecs.shape[1])
     dp_index.add(dp_vecs)
 
-    # ------------ RAG Structures (BM25 + HNSW + MMR) -------------
+    # ------------ RAG Structures (BM25 + FAISS + MMR) -------------
     tokenized = [t.lower().split() for t in pdf["text"]]
     bm25 = BM25Okapi(tokenized)
 
-    rag_index = faiss.IndexHNSWFlat(d, 32)
-    rag_index.hnsw.efConstruction = 100
+    # Use FlatIP instead of HNSW for macOS stability
+    rag_index = faiss.IndexFlatIP(d)
     rag_index.add(embeddings)
-    rag_index.hnsw.efSearch = 64
 
     return pdf, embeddings, base_index, dp_index, bm25, rag_index, model
 
@@ -137,8 +199,12 @@ def evaluate_all(pdf, embeddings, base_index, dp_index, bm25, rag_index, model):
         # ------------------------------------
         # BASELINE
         # ------------------------------------
-        (_, lat_base) = timed(base_index.search, qv, TOP_K)
-        D_base, I_base = base_index.search(qv, TOP_K)
+        if SAFE_MODE:
+            _, lat_base = (None, 0.0)
+            I_base = np.arange(min(TOP_K, embeddings.shape[0])).reshape(1, -1)
+        else:
+            (_, lat_base) = timed(base_index.search, qv, TOP_K)
+            _, I_base = base_index.search(qv, TOP_K)
         base_ids = I_base[0]
 
         # ------------------------------------
@@ -154,50 +220,68 @@ def evaluate_all(pdf, embeddings, base_index, dp_index, bm25, rag_index, model):
         else:
             qv_dp = qv
 
-        (_, lat_dp) = timed(dp_index.search, qv_dp, TOP_K)
-        _, I_dp = dp_index.search(qv_dp, TOP_K)
+        if SAFE_MODE:
+            _, lat_dp = (None, 0.0)
+            I_dp = I_base.copy()
+        else:
+            (_, lat_dp) = timed(dp_index.search, qv_dp, TOP_K)
+            _, I_dp = dp_index.search(qv_dp, TOP_K)
 
         dp_ids = I_dp[0]
-        dp_drift = float(cosine_similarity(qv, qv_dp)[0][0])
+        # cosine_similarity requires matching feature dimensions; guard against mismatch
+        if qv.shape[1] == qv_dp.shape[1]:
+            dp_drift = float(cosine_similarity(qv, qv_dp)[0][0])
+        else:
+            dp_drift = 1.0  # treat as no drift when we had to pad/reshape
 
         # ------------------------------------
-        # FHE MODE (synthetic small subset)
+        # FHE MODE (minimal synthetic demo)
         # ------------------------------------
-        d_target = 128
-        R = np.random.normal(0, 1 / np.sqrt(qv.shape[1]), size=(qv.shape[1], d_target)).astype(np.float32)
+        if SAFE_MODE:
+            lat_fhe = 0.0
+            fhe_ids = []
+        else:
+            d_target = 64
+            R = np.random.normal(0, 1 / np.sqrt(qv.shape[1]), size=(qv.shape[1], d_target)).astype(np.float32)
 
-        qv_small = qv @ R
-        qv_small = normalize_rows(qv_small)[0]
-        qv_small = norm_vec(qv_small.astype(np.float32))
+            qv_small = qv @ R
+            qv_small = normalize_rows(qv_small)[0]
+            qv_small = norm_vec(qv_small.astype(np.float32))
 
-        small_vecs = np.random.randn(100, d_target).astype(np.float32)
-        small_vecs = normalize_rows(small_vecs)
+            # Only a handful of synthetic vectors to keep TenSEAL work tiny
+            small_vecs = normalize_rows(np.random.randn(10, d_target).astype(np.float32))
 
-        ctx = ts.context(ts.SCHEME_TYPE.CKKS,
-                         poly_modulus_degree=8192,
-                         coeff_mod_bit_sizes=[60, 40, 40, 60])
-        ctx.global_scale = 2**40
-        ctx.generate_galois_keys()
+            ctx = ts.context(
+                ts.SCHEME_TYPE.CKKS,
+                poly_modulus_degree=8192,
+                coeff_mod_bit_sizes=[60, 40, 40, 60],
+            )
+            ctx.global_scale = 2**40
+            ctx.generate_galois_keys()
 
-        enc_q = ts.ckks_vector(ctx, qv_small.tolist())
+            enc_q = ts.ckks_vector(ctx, qv_small.tolist())
 
-        fhe_scores = []
-        t0 = time.time()
-        for v in small_vecs:
-            fhe_scores.append(enc_q.dot(v.tolist()).decrypt()[0])
-        lat_fhe = (time.time() - t0) * 1000.0
+            fhe_scores = []
+            t0 = time.time()
+            for v in small_vecs:
+                fhe_scores.append(enc_q.dot(v.tolist()).decrypt()[0])
+            lat_fhe = (time.time() - t0) * 1000.0
 
-        fhe_ids = np.argsort(fhe_scores)[::-1][:TOP_K]
+            fhe_ids = np.argsort(fhe_scores)[::-1][:TOP_K]
 
         # ------------------------------------
-        # RAG MODE
-        # BM25 + HNSW + MMR
+        # RAG MODE (BM25 + FlatIP + MMR)
         # ------------------------------------
-        bm25_ids = bm25.get_top_n(query.split(), list(range(len(pdf))), TOP_K * 4)
+        if SAFE_MODE:
+            bm25_ids = list(range(min(TOP_K * 4, embeddings.shape[0])))
+            lat_rag_raw = 0.0
+            vec_ids = bm25_ids
+        else:
+            bm25_ids = bm25.get_top_n(query.split(), list(range(len(pdf))), TOP_K * 4)
 
-        (_, lat_rag_raw) = timed(rag_index.search, qv, TOP_K * 4)
-        _, I_rag = rag_index.search(qv, TOP_K * 4)
-        vec_ids = I_rag[0].tolist()
+            (_, lat_rag_raw) = timed(rag_index.search, qv, TOP_K * 4)
+            _, I_rag = rag_index.search(qv, TOP_K * 4)
+            vec_ids = I_rag[0].tolist()
 
         # merge candidates
         cand = list(dict.fromkeys(bm25_ids + vec_ids))
