@@ -1,22 +1,5 @@
-"""
-evaluation.py
-
-Benchmarks the 4 retrieval pipelines:
-  1. Baseline (vector)
-  2. Differential Privacy (DP)
-  3. Fully Homomorphic Encryption (FHE)
-  4. Optimized / RAG
-
-Outputs:
-  - evaluation_results.csv
-  - plots/latency_comparison.png
-  - plots/privacy_utility_curve.png
-  - plots/overlap_heatmap.png
-"""
-
 import os
 import time
-import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -24,10 +7,8 @@ import seaborn as sns
 from sentence_transformers import SentenceTransformer
 import faiss
 
-from pipeline.pipeline import build_faiss_index, search_faiss
-from pipeline.pipeline_mode import mode_baseline, mode_dp, mode_fhe, mode_rag
-from pipeline.utils import normalize_rows
-from pipeline.pipeline_mode import norm_vec
+from pipeline.pipeline import search_faiss
+from pipeline.utils import normalize_rows, norm_vec
 import tenseal as ts
 
 
@@ -47,34 +28,52 @@ QUERIES = [
 PLOTS_DIR = "plots"
 os.makedirs(PLOTS_DIR, exist_ok=True)
 
+
+# -------------------------------------------------------
+# Utility Functions
+# -------------------------------------------------------
+
 def run_timed(func, *args, **kwargs):
-    """Run a function and return (result, latency_ms)."""
     start = time.time()
     res = func(*args, **kwargs)
-    elapsed = (time.time() - start) * 1000.0
-    return res, elapsed
+    return res, (time.time() - start) * 1000.0
 
 
-def recall_overlap(topk_a, topk_b):
-    """Compute overlap ratio between two top-k index lists."""
-    return len(set(topk_a).intersection(set(topk_b))) / len(topk_a)
+def recall_at_k(base, other):
+    return len(set(base).intersection(set(other))) / len(base)
 
+
+def precision_at_k(base, other):
+    return len(set(base).intersection(set(other))) / len(other)
+
+
+def accuracy_at_k(base, other):
+    # Hit rate: proportion of exact matches
+    matches = sum(1 for a, b in zip(base, other) if a == b)
+    return matches / len(base)
+
+
+def mrr(base, other):
+    # Rank position of first baseline item in other ranking
+    for rank, doc_id in enumerate(other, start=1):
+        if doc_id in base:
+            return 1.0 / rank
+    return 0.0
+
+
+# -------------------------------------------------------
+# Evaluation Core
+# -------------------------------------------------------
 
 def benchmark_all(data_path, model_name, index_paths):
-    """Run all pipelines and collect metrics."""
     model = SentenceTransformer(model_name)
     results = []
 
-    # load baseline FAISS index (already built)
+    # Load prebuilt indexes
     baseline_index = faiss.read_index(index_paths["baseline"])
-
-    # Load DP index (already built)
     dp_index = faiss.read_index(index_paths["dp"])
-
-    # Load RAG index (HNSW)
     rag_index = faiss.read_index(index_paths["rag"])
 
-    # Create a small subset for FHE POC
     fhe_subset = 200
 
     for query in QUERIES:
@@ -82,106 +81,167 @@ def benchmark_all(data_path, model_name, index_paths):
         qv = model.encode([query])
         qv = normalize_rows(qv.astype(np.float32))
 
-        # ---------------- Baseline ----------------
-        (_, latency_baseline) = run_timed(search_faiss, baseline_index, qv, 10)
+        # ------------------ Baseline ------------------
+        (_, lat_base) = run_timed(search_faiss, baseline_index, qv, 10)
         D_base, I_base = search_faiss(baseline_index, qv, 10)
+        base_ids = I_base[0]
 
-        # ---------------- DP ----------------
-        (_, latency_dp) = run_timed(search_faiss, dp_index, qv, 10)
-        D_dp, I_dp = search_faiss(dp_index, qv, 10)
-        overlap_dp = recall_overlap(I_base[0], I_dp[0])
+        # ------------------ DP Mode ------------------
+        d = dp_index.d
+        text_dim = qv.shape[1]
+        attr_dim = d - text_dim
+        qv_attr = np.zeros((1, attr_dim), dtype=np.float32)
+        qv_combined = np.hstack([qv * 0.7, qv_attr * 0.3])
+        qv_combined = normalize_rows(qv_combined)
 
-        # prepare projection
+        (_, lat_dp) = run_timed(search_faiss, dp_index, qv_combined, 10)
+        D_dp, I_dp = search_faiss(dp_index, qv_combined, 10)
+        dp_ids = I_dp[0]
+
+        # ------------------ FHE Mode ------------------
         d_target = 256
         rng = np.random.default_rng(1234)
         R = rng.normal(0, 1 / np.sqrt(qv.shape[1]), size=(qv.shape[1], d_target)).astype(np.float32)
         qv_small = normalize_rows(qv @ R)
         qv_small = norm_vec(qv_small.ravel().astype(np.float32))
-        # simulate small DB for FHE
+
         vecs = np.random.randn(fhe_subset, qv_small.shape[0]).astype(np.float32)
         vecs = normalize_rows(vecs)
-        ctx = ts.context(ts.SCHEME_TYPE.CKKS, poly_modulus_degree=8192,
+
+        ctx = ts.context(ts.SCHEME_TYPE.CKKS,
+                         poly_modulus_degree=8192,
                          coeff_mod_bit_sizes=[60, 40, 40, 60])
         ctx.generate_galois_keys()
-        ctx.global_scale = 2 ** 40
+        ctx.global_scale = 2**40
         enc_q = ts.ckks_vector(ctx, qv_small.tolist())
 
         fhe_scores = []
         t0 = time.time()
         for v in vecs:
             fhe_scores.append(enc_q.dot(v.tolist()).decrypt()[0])
-        latency_fhe = (time.time() - t0) * 1000.0
-        overlap_fhe = 1.0  # synthetic; optional placeholder
+        lat_fhe = (time.time() - t0) * 1000.0
 
-        # ---------------- RAG ----------------
-        (_, latency_rag) = run_timed(search_faiss, rag_index, qv, 10)
+        # We have no faiss index so use synthetic top-k
+        fhe_ids = np.argsort(fhe_scores)[::-1][:10]
+
+        # ------------------ RAG (HNSW) ------------------
+        (_, lat_rag) = run_timed(search_faiss, rag_index, qv, 10)
         D_rag, I_rag = search_faiss(rag_index, qv, 10)
-        overlap_rag = recall_overlap(I_base[0], I_rag[0])
+        rag_ids = I_rag[0]
 
-        # ---------------- Collect ----------------
+        # -------------------------------------------------------
+        # Compute final 5 metrics
+        # -------------------------------------------------------
+
         results.append({
             "query": query,
-            "baseline_latency_ms": latency_baseline,
-            "dp_latency_ms": latency_dp,
-            "fhe_latency_ms": latency_fhe,
-            "rag_latency_ms": latency_rag,
-            "dp_overlap": overlap_dp,
-            "fhe_overlap": overlap_fhe,
-            "rag_overlap": overlap_rag
+
+            # Latency
+            "baseline_latency_ms": lat_base,
+            "dp_latency_ms": lat_dp,
+            "fhe_latency_ms": lat_fhe,
+            "rag_latency_ms": lat_rag,
+
+            # Recall
+            "dp_recall": recall_at_k(base_ids, dp_ids),
+            "fhe_recall": recall_at_k(base_ids, fhe_ids),
+            "rag_recall": recall_at_k(base_ids, rag_ids),
+
+            # Precision
+            "dp_precision": precision_at_k(base_ids, dp_ids),
+            "fhe_precision": precision_at_k(base_ids, fhe_ids),
+            "rag_precision": precision_at_k(base_ids, rag_ids),
+
+            # Accuracy / Hit Rate
+            "dp_accuracy": accuracy_at_k(base_ids, dp_ids),
+            "fhe_accuracy": accuracy_at_k(base_ids, fhe_ids),
+            "rag_accuracy": accuracy_at_k(base_ids, rag_ids),
+
+            # MRR
+            "dp_mrr": mrr(base_ids, dp_ids),
+            "fhe_mrr": mrr(base_ids, fhe_ids),
+            "rag_mrr": mrr(base_ids, rag_ids),
         })
 
     df = pd.DataFrame(results)
     df.to_csv("evaluation_results.csv", index=False)
-    print("\nSaved: evaluation_results.csv")
+    print("Saved: evaluation_results.csv")
     return df
 
 
+# -------------------------------------------------------
+# Plotting
+# -------------------------------------------------------
+
 def generate_plots(df):
-    """Create latency bars, privacy-utility curve, overlap heatmap."""
-    # Average across queries
     avg = df.mean(numeric_only=True)
 
-    # Latency Comparison
+    # Latency bar chart
     plt.figure(figsize=(8, 5))
     modes = ["Baseline", "DP", "FHE", "RAG"]
-    times = [avg["baseline_latency_ms"], avg["dp_latency_ms"],
-             avg["fhe_latency_ms"], avg["rag_latency_ms"]]
-    plt.bar(modes, times, color=["#3b82f6", "#f59e0b", "#10b981", "#8b5cf6"])
-    plt.ylabel("Average Query Latency (ms)")
-    plt.title("Retrieval Latency Comparison")
+    times = [
+        avg["baseline_latency_ms"],
+        avg["dp_latency_ms"],
+        avg["fhe_latency_ms"],
+        avg["rag_latency_ms"]
+    ]
+    plt.bar(modes, times)
+    plt.ylabel("Average Latency (ms)")
+    plt.title("Query Latency Comparison")
     plt.tight_layout()
     plt.savefig(os.path.join(PLOTS_DIR, "latency_comparison.png"))
     plt.close()
 
-    # Privacy–Utility curve (Baseline vs DP overlap)
-    plt.figure(figsize=(6, 4))
-    plt.plot(df["dp_overlap"], label="DP Overlap", marker="o", color="#f59e0b")
-    plt.xlabel("Query Index")
-    plt.ylabel("Recall Overlap vs Baseline")
-    plt.title("Privacy–Utility Curve (DP)")
+    # Recall comparison
+    plt.figure(figsize=(8, 5))
+    plt.plot(df["dp_recall"], label="DP", marker="o")
+    plt.plot(df["fhe_recall"], label="FHE", marker="o")
+    plt.plot(df["rag_recall"], label="RAG", marker="o")
+    plt.title("Recall@K vs Baseline")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(PLOTS_DIR, "privacy_utility_curve.png"))
+    plt.savefig(os.path.join(PLOTS_DIR, "recall.png"))
     plt.close()
 
-    # Overlap heatmap
-    overlap_matrix = np.array([
-        [1.0, avg["dp_overlap"], avg["fhe_overlap"], avg["rag_overlap"]],
-        [avg["dp_overlap"], 1.0, avg["dp_overlap"], avg["dp_overlap"]],
-        [avg["fhe_overlap"], avg["dp_overlap"], 1.0, avg["dp_overlap"]],
-        [avg["rag_overlap"], avg["dp_overlap"], avg["dp_overlap"], 1.0],
-    ])
-    plt.figure(figsize=(6, 5))
-    sns.heatmap(overlap_matrix, annot=True, fmt=".2f",
-                xticklabels=["Baseline", "DP", "FHE", "RAG"],
-                yticklabels=["Baseline", "DP", "FHE", "RAG"],
-                cmap="Purples")
-    plt.title("Top-K Result Overlap Between Pipelines")
+    # Precision comparison
+    plt.figure(figsize=(8, 5))
+    plt.plot(df["dp_precision"], label="DP", marker="o")
+    plt.plot(df["fhe_precision"], label="FHE", marker="o")
+    plt.plot(df["rag_precision"], label="RAG", marker="o")
+    plt.title("Precision@K vs Baseline")
+    plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(PLOTS_DIR, "overlap_heatmap.png"))
+    plt.savefig(os.path.join(PLOTS_DIR, "precision.png"))
     plt.close()
 
-    print(f"Plots saved under {PLOTS_DIR}/")
+    # Accuracy comparison
+    plt.figure(figsize=(8, 5))
+    plt.plot(df["dp_accuracy"], label="DP", marker="o")
+    plt.plot(df["fhe_accuracy"], label="FHE", marker="o")
+    plt.plot(df["rag_accuracy"], label="RAG", marker="o")
+    plt.title("Accuracy@K (Hit Rate)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS_DIR, "accuracy.png"))
+    plt.close()
+
+    # MRR comparison
+    plt.figure(figsize=(8, 5))
+    plt.plot(df["dp_mrr"], label="DP", marker="o")
+    plt.plot(df["fhe_mrr"], label="FHE", marker="o")
+    plt.plot(df["rag_mrr"], label="RAG", marker="o")
+    plt.title("MRR vs Baseline")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS_DIR, "mrr.png"))
+    plt.close()
+
+    print("Plots saved.")
+
+
+# -------------------------------------------------------
+# Entry
+# -------------------------------------------------------
 
 def main():
     data_path = "./data/medical_transcriptions.csv"
@@ -190,8 +250,7 @@ def main():
     index_paths = {
         "baseline": "./faiss_mtsamples_baseline.faiss",
         "dp": "./faiss_mtsamples_dp.faiss",
-        "fhe": "./faiss_mtsamples_fhe.faiss",   # optional placeholder
-        "rag": "./faiss_mtsamples_rag.faiss"
+        "rag": "./faiss_mtsamples_rag.faiss",
     }
 
     df = benchmark_all(data_path, model_name, index_paths)
