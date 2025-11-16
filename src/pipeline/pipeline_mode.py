@@ -196,58 +196,69 @@ def mode_fhe(args):
 # ============================================================
 
 def mode_rag(args):
-    """
-    Optimized RAG:
-    - HNSW FAISS
-    - Optional BM25 hybrid
-    - MMR re-ranking
-    """
-    spark = build_spark()
+    # Safer FAISS threading on macOS to avoid segfaults
+    import os
+    try:
+        faiss.omp_set_num_threads(1)
+    except:
+        pass
 
-    pdf = load_mtsamples_df(spark, args.data_path)
+    spark = build_spark()
+    data_path = args.data_path
+    pdf = load_mtsamples_df(spark, data_path)
+
+    # --- Build embeddings ---
     pdf = build_embeddings_with_spark(pdf, args.model)
 
-    vecs = np.vstack(pdf["vec"].values).astype(np.float32)
+    # Ensure contiguous float32 array (critical for FAISS HNSW stability)
+    vecs = np.ascontiguousarray(np.vstack(pdf["vec"].values).astype(np.float32))
+
+    # --- Build HNSW index ---
     index = build_faiss_index(
         vecs,
         args.index_path,
         hnsw=True,
-        hnsw_M=args.hnsw_M,
-        efC=args.efC,
-    )
-    print(f"HNSW FAISS index saved at: {args.index_path}")
-
-    if not args.query:
-        return
-
-    index = faiss.read_index(args.index_path)
-    model = SentenceTransformer(args.model)
-
-    # Encode query
-    qv = model.encode([args.query])
-    qv = normalize_rows(qv.astype(np.float32))
-
-    # Vector search candidates
-    D_vec, I_vec = search_faiss(index, qv, k=args.candidate_k, efSearch=args.efS)
-    cand_ids = list(I_vec[0])
-
-    # Hybrid lexical retrieval
-    if args.enable_hybrid:
-        bm_ids = bm25_topk(pdf["text"].tolist(), args.query, topk=args.bm25_topk)
-        cand_ids = list(set(cand_ids) | set(bm_ids))
-
-    # MMR re-ranking
-    cand_vecs = vecs[cand_ids]
-    final_ids = mmr_rerank(
-        qv.ravel(),
-        cand_vecs,
-        cand_ids,
-        k=args.topk,
-        lambda_param=args.mmr_lambda,
+        hnsw_M=min(max(args.hnsw_M, 8), 32),   # mac-safe
+        efC=min(max(args.efC, 40), 120)       # mac-safe range
     )
 
-    print(f"\n[Optimized RAG] Query: {args.query}")
-    for rank, idx in enumerate(final_ids):
-        snippet = pdf.iloc[idx]["text"][:200].replace("\n", " ")
-        score = np.dot(qv.ravel(), pdf.iloc[idx]["vec"])
-        print(f"{rank+1:>2}. score={score:.4f} :: {snippet}...")
+    if args.query:
+        index = faiss.read_index(args.index_path)
+        try:
+            index.hnsw.efSearch = min(max(args.efS, 40), 120)   # Query-time stability
+        except:
+            pass
+
+        model = SentenceTransformer(args.model)
+
+        # --- Query Vector ---
+        qv = model.encode([args.query])
+        qv = normalize_rows(qv.astype(np.float32))
+        qv = np.ascontiguousarray(qv)
+
+        # --- Vector Retrieval ---
+        Dv, Iv = search_faiss(index, qv, k=args.candidate_k)
+        cand_ids = Iv[0].tolist()
+
+        # --- Optional Hybrid Retrieval ---
+        if args.enable_hybrid:
+            bm_idx = bm25_topk(pdf["text"].tolist(), args.query, topk=args.bm25_topk)
+            cand_ids = list(set(cand_ids) | set(bm_idx))
+
+        # Prepare candidate vectors (contiguous!)
+        cand_vecs = np.ascontiguousarray(vecs[cand_ids])
+
+        # --- MMR Re-ranking ---
+        final_ids = mmr_rerank(
+            qv.ravel(),
+            cand_vecs,
+            cand_ids,
+            k=args.topk,
+            lambda_param=args.mmr_lambda
+        )
+
+        # --- Print Output ---
+        print(f"\n[Optimized RAG] Query: {args.query}")
+        for rank, idx in enumerate(final_ids):
+            snippet = pdf.iloc[idx]["text"][:200].replace("\n", " ")
+            print(f"{rank+1:>2}. score{Dv[0][0]:.4f} :: {snippet}...")
