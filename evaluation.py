@@ -4,6 +4,8 @@ import time
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import os
+os.environ["HF_HUB_DISABLE_SSL_VERIFICATION"] = "1"
 
 # NOTE: keep imports minimal in evaluation to reduce native lib pressure on macOS
 from sentence_transformers import SentenceTransformer
@@ -159,11 +161,16 @@ def build_all(data_path, model_name):
     attr_emb = normalize_rows(attr_emb.astype(np.float32))
 
     sigma = 0.15
-    noisy = attr_emb + np.random.normal(0, sigma, attr_emb.shape).astype(np.float32)
-    noisy = normalize_rows(noisy)
+    # Add noise to main text embeddings
+    noisy_embeddings = embeddings + np.random.normal(0, sigma, embeddings.shape).astype(np.float32)
+    noisy_embeddings = normalize_rows(noisy_embeddings)
+
+    # Add noise to attribute embeddings
+    noisy_attr_emb = attr_emb + np.random.normal(0, sigma, attr_emb.shape).astype(np.float32)
+    noisy_attr_emb = normalize_rows(noisy_attr_emb)
 
     dp_vecs = normalize_rows(
-        np.hstack([embeddings * 0.7, noisy * 0.3]).astype(np.float32)
+        np.hstack([noisy_embeddings * 0.7, noisy_attr_emb * 0.3]).astype(np.float32)
     )
 
     dp_index = faiss.IndexFlatIP(dp_vecs.shape[1])
