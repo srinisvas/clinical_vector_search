@@ -4,8 +4,6 @@ import time
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import os
-os.environ["HF_HUB_DISABLE_SSL_VERIFICATION"] = "1"
 
 # NOTE: keep imports minimal in evaluation to reduce native lib pressure on macOS
 from sentence_transformers import SentenceTransformer
@@ -56,6 +54,9 @@ QUERIES = [
 TOP_K = 10
 
 SAFE_MODE = False  # set True if native segfaults persist; modes will degrade gracefully
+
+# Define the DP noise sigmas we want to sweep for pure DP mode
+DP_SIGMAS = [0.05, 0.1, 0.15, 0.2]
 
 
 # ============================================================
@@ -152,29 +153,36 @@ def build_all(data_path, model_name):
     base_index = faiss.IndexFlatIP(d)
     base_index.add(embeddings)
 
-    # ------------ DP Index -------------
-    attr_texts = [
-        f"{n} {g} {a} {c}"
-        for n, g, a, c in zip(pdf["name"], pdf["gender"], pdf["age"], pdf["city"])
-    ]
+    # ------------ DP Indexes with ALL attributes and multiple sigmas -------------
+    # Use all columns except `text` and `vec` as attributes
+    attr_cols = [c for c in pdf.columns if c not in ["text", "vec"]]
+
+    # Join all attribute fields into one string per row
+    attr_texts = pdf[attr_cols].astype(str).apply(lambda row: " ".join(row.values), axis=1).tolist()
+
     attr_emb = model.encode(attr_texts, batch_size=32, show_progress_bar=False)
     attr_emb = normalize_rows(attr_emb.astype(np.float32))
 
-    sigma = 0.15
-    # Add noise to main text embeddings
-    noisy_embeddings = embeddings + np.random.normal(0, sigma, embeddings.shape).astype(np.float32)
-    noisy_embeddings = normalize_rows(noisy_embeddings)
+    dp_indices = {}
+    dp_vecs_map = {}
 
-    # Add noise to attribute embeddings
-    noisy_attr_emb = attr_emb + np.random.normal(0, sigma, attr_emb.shape).astype(np.float32)
-    noisy_attr_emb = normalize_rows(noisy_attr_emb)
+    for sigma in DP_SIGMAS:
+        noisy = attr_emb + np.random.normal(0, sigma, attr_emb.shape).astype(np.float32)
+        noisy = normalize_rows(noisy)
 
-    dp_vecs = normalize_rows(
-        np.hstack([noisy_embeddings * 0.7, noisy_attr_emb * 0.3]).astype(np.float32)
-    )
+        dp_vecs = normalize_rows(
+            np.hstack([embeddings * 0.7, noisy * 0.3]).astype(np.float32)
+        )
 
-    dp_index = faiss.IndexFlatIP(dp_vecs.shape[1])
-    dp_index.add(dp_vecs)
+        index = faiss.IndexFlatIP(dp_vecs.shape[1])
+        index.add(dp_vecs)
+
+        dp_indices[sigma] = index
+        dp_vecs_map[sigma] = dp_vecs
+
+    # For DP+RAG we keep using sigma=0.15 specifically
+    dp_rag_sigma = 0.15
+    dp_rag_index = dp_indices[dp_rag_sigma]
 
     # ------------ RAG Structures (BM25 + FAISS + MMR) -------------
     tokenized = [t.lower().split() for t in pdf["text"]]
@@ -184,14 +192,14 @@ def build_all(data_path, model_name):
     rag_index = faiss.IndexFlatIP(d)
     rag_index.add(embeddings)
 
-    return pdf, embeddings, base_index, dp_index, bm25, rag_index, model
+    return pdf, embeddings, base_index, dp_indices, dp_rag_index, bm25, rag_index, model
 
 
 # ============================================================
 # Compute metrics
 # ============================================================
 
-def evaluate_all(pdf, embeddings, base_index, dp_index, bm25, rag_index, model):
+def evaluate_all(pdf, embeddings, base_index, dp_indices, dp_rag_index, bm25, rag_index, model):
     results = []
 
     for query in QUERIES:
@@ -215,31 +223,40 @@ def evaluate_all(pdf, embeddings, base_index, dp_index, bm25, rag_index, model):
         base_ids = I_base[0]
 
         # ------------------------------------
-        # DP MODE
+        # DP modes sweep
         # ------------------------------------
+        dp_latencies = {}
+        dp_id_lists = {}
+        dp_drifts = {}
+
         text_dim = qv.shape[1]
-        dp_dim = dp_index.d
 
-        if dp_dim > text_dim:
-            attr_dim = dp_dim - text_dim
-            qv_zero_attr = np.zeros((1, attr_dim), dtype=np.float32)
-            qv_dp = normalize_rows(np.hstack([qv * 0.7, qv_zero_attr * 0.3]))
-        else:
-            qv_dp = qv
+        for sigma, dp_index in dp_indices.items():
+            dp_dim = dp_index.d
+            if dp_dim > text_dim:
+                attr_dim = dp_dim - text_dim
+                qv_zero_attr = np.zeros((1, attr_dim), dtype=np.float32)
+                qv_dp = normalize_rows(np.hstack([qv * 0.7, qv_zero_attr * 0.3]))
+            else:
+                qv_dp = qv
 
-        if SAFE_MODE:
-            _, lat_dp = (None, 0.0)
-            I_dp = I_base.copy()
-        else:
-            (_, lat_dp) = timed(dp_index.search, qv_dp, TOP_K)
-            _, I_dp = dp_index.search(qv_dp, TOP_K)
+            if SAFE_MODE:
+                _, lat_dp = (None, 0.0)
+                I_dp = I_base.copy()
+            else:
+                (_, lat_dp) = timed(dp_index.search, qv_dp, TOP_K)
+                _, I_dp = dp_index.search(qv_dp, TOP_K)
 
-        dp_ids = I_dp[0]
-        # cosine_similarity requires matching feature dimensions; guard against mismatch
-        if qv.shape[1] == qv_dp.shape[1]:
-            dp_drift = float(cosine_similarity(qv, qv_dp)[0][0])
-        else:
-            dp_drift = 1.0  # treat as no drift when we had to pad/reshape
+            dp_ids = I_dp[0]
+            # cosine_similarity requires matching feature dimensions; guard against mismatch
+            if qv.shape[1] == qv_dp.shape[1]:
+                dp_drift = float(cosine_similarity(qv, qv_dp)[0][0])
+            else:
+                dp_drift = 1.0  # treat as no drift when we had to pad/reshape
+
+            dp_latencies[sigma] = lat_dp
+            dp_id_lists[sigma] = dp_ids
+            dp_drifts[sigma] = dp_drift
 
         # ------------------------------------
         # FHE MODE (minimal synthetic demo)
@@ -317,38 +334,95 @@ def evaluate_all(pdf, embeddings, base_index, dp_index, bm25, rag_index, model):
         rag_ids = [cand[i] for i in selected]
 
         # ------------------------------------
+        # DP + Fastened RAG MODE
+        # ------------------------------------
+        # 1) Candidate generation with BM25 (same as RAG)
+        if SAFE_MODE:
+            bm25_ids_dp_rag = list(range(min(TOP_K * 4, embeddings.shape[0])))
+            lat_dp_rag_raw = 0.0
+            vec_ids_dp_rag = bm25_ids_dp_rag
+        else:
+            bm25_ids_dp_rag = bm25.get_top_n(query.split(), list(range(len(pdf))), TOP_K * 4)
+
+            (_, lat_dp_rag_raw) = timed(rag_index.search, qv_dp[:, :rag_index.d], TOP_K * 4)
+            _, I_dp_rag = rag_index.search(qv_dp[:, :rag_index.d], TOP_K * 4)
+            vec_ids_dp_rag = I_dp_rag[0].tolist()
+
+        cand_dp_rag = list(dict.fromkeys(bm25_ids_dp_rag + vec_ids_dp_rag))
+        cand_vecs_dp_rag = embeddings[cand_dp_rag]
+
+        q = qv.ravel()
+        sims_dp_rag = cand_vecs_dp_rag @ q
+
+        selected_dp_rag = []
+        candidate_ids_dp_rag = list(range(len(cand_dp_rag)))
+
+        while len(selected_dp_rag) < TOP_K and candidate_ids_dp_rag:
+            if len(selected_dp_rag) == 0:
+                best = int(np.argmax(sims_dp_rag))
+            else:
+                selected_vecs_dp_rag = cand_vecs_dp_rag[selected_dp_rag]
+                diversity_dp_rag = cosine_similarity(
+                    cand_vecs_dp_rag[candidate_ids_dp_rag],
+                    selected_vecs_dp_rag,
+                ).max(axis=1)
+                score_dp_rag = 0.7 * sims_dp_rag[candidate_ids_dp_rag] - 0.3 * diversity_dp_rag
+                best_local = int(np.argmax(score_dp_rag))
+                best = candidate_ids_dp_rag[best_local]
+
+            selected_dp_rag.append(best)
+            candidate_ids_dp_rag.remove(best)
+
+        dp_rag_ids = [cand_dp_rag[i] for i in selected_dp_rag]
+
+        # ------------------------------------
         # Metrics
         # ------------------------------------
         # rankings for NDCG
         def rank_positions(ref, pred):
-            mapping = {doc_id: i+1 for i, doc_id in enumerate(ref)}
+            mapping = {doc_id: i + 1 for i, doc_id in enumerate(ref)}
             return [mapping.get(x, 0) for x in pred]
 
-        ranks_dp = rank_positions(base_ids, dp_ids)
-        ranks_rag = rank_positions(base_ids, rag_ids)
-
-        ndcg_dp = ndcg_at_k(ranks_dp, TOP_K)
-        ndcg_rag = ndcg_at_k(ranks_rag, TOP_K)
-
-        agreement_rag = index_agreement(base_ids, rag_ids)
-        agreement_dp = index_agreement(base_ids, dp_ids)
-
-        results.append({
+        # Compute metrics for each DP sigma
+        row = {
             "query": query,
             "baseline_latency": lat_base,
-            "dp_latency": lat_dp,
-            "fhe_latency": lat_fhe,
             "rag_latency": lat_rag_raw,
+            "dp_rag_latency": lat_dp_rag_raw,
+        }
 
-            "ndcg_dp": ndcg_dp,
-            "ndcg_rag": ndcg_rag,
+        # RAG-only metrics (baseline vs rag)
+        ranks_rag = rank_positions(base_ids, rag_ids)
+        ndcg_rag = ndcg_at_k(ranks_rag, TOP_K)
+        agreement_rag = index_agreement(base_ids, rag_ids)
+        row["ndcg_rag"] = ndcg_rag
+        row["agreement_rag"] = agreement_rag
 
-            "agreement_dp": agreement_dp,
-            "agreement_rag": agreement_rag,
+        # DP+RAG metrics
+        ranks_dp_rag = rank_positions(base_ids, dp_rag_ids)
+        ndcg_dp_rag = ndcg_at_k(ranks_dp_rag, TOP_K)
+        agreement_dp_rag = index_agreement(base_ids, dp_rag_ids)
+        row["ndcg_dp_rag"] = ndcg_dp_rag
+        row["agreement_dp_rag"] = agreement_dp_rag
 
-            "dp_drift": dp_drift,
-            "rag_improvement": ndcg_rag - ndcg_dp
-        })
+        # Per-sigma DP metrics
+        for sigma in DP_SIGMAS:
+            dp_ids = dp_id_lists[sigma]
+            dp_latency = dp_latencies[sigma]
+            dp_drift = dp_drifts[sigma]
+
+            ranks_dp = rank_positions(base_ids, dp_ids)
+            ndcg_dp = ndcg_at_k(ranks_dp, TOP_K)
+            agreement_dp = index_agreement(base_ids, dp_ids)
+
+            # encode fields with sigma in the key
+            suffix = f"_{sigma}".replace(".", "p")
+            row[f"dp_latency{suffix}"] = dp_latency
+            row[f"ndcg_dp{suffix}"] = ndcg_dp
+            row[f"agreement_dp{suffix}"] = agreement_dp
+            row[f"dp_drift{suffix}"] = dp_drift
+
+        results.append(row)
 
     return pd.DataFrame(results)
 
@@ -358,50 +432,65 @@ def evaluate_all(pdf, embeddings, base_index, dp_index, bm25, rag_index, model):
 # ============================================================
 
 def plot_results(df):
-    # LATENCY (log scale)
+    """Plot latency and quality metrics.
+
+    Note: After introducing DP sweeps, per-sigma DP metrics are encoded
+    as dp_latency_<sigma>, ndcg_dp_<sigma>, etc. We visualize:
+    - Latency: baseline vs RAG vs DP+RAG
+    - NDCG & agreement: RAG and DP+RAG
+    - DP sweep: NDCG across all four DP sigmas.
+    """
+    # LATENCY (log scale) – baseline, RAG, DP+RAG
     plt.figure(figsize=(9, 5))
-    modes = ["baseline_latency", "dp_latency", "fhe_latency", "rag_latency"]
-    df[modes].mean().plot(kind="bar", log=True)
+    latency_cols = [
+        "baseline_latency",
+        "rag_latency",
+        "dp_rag_latency",
+    ]
+    # Guard against missing columns in case of partial runs
+    latency_cols = [c for c in latency_cols if c in df.columns]
+    df[latency_cols].mean().plot(kind="bar", log=True)
     plt.title("Latency (log scale)")
     plt.ylabel("Latency (ms, log)")
     plt.tight_layout()
     plt.savefig(os.path.join(PLOTS_DIR, "latency_log.png"))
     plt.close()
 
-    # NDCG
+    # NDCG – RAG and DP+RAG
     plt.figure(figsize=(9, 5))
-    plt.plot(df["ndcg_dp"], marker="o", label="DP")
-    plt.plot(df["ndcg_rag"], marker="o", label="RAG")
-    plt.title("NDCG Comparison")
+    if "ndcg_rag" in df.columns:
+        plt.plot(df["ndcg_rag"], marker="o", label="RAG")
+    if "ndcg_dp_rag" in df.columns:
+        plt.plot(df["ndcg_dp_rag"], marker="o", label="DP+RAG")
+    plt.title("NDCG Comparison (RAG vs DP+RAG)")
     plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(PLOTS_DIR, "ndcg.png"))
     plt.close()
 
-    # Agreement
+    # Agreement – RAG and DP+RAG
     plt.figure(figsize=(9, 5))
-    plt.plot(df["agreement_dp"], marker="o", label="DP")
-    plt.plot(df["agreement_rag"], marker="o", label="RAG")
-    plt.title("Index Agreement with Baseline")
+    if "agreement_rag" in df.columns:
+        plt.plot(df["agreement_rag"], marker="o", label="RAG")
+    if "agreement_dp_rag" in df.columns:
+        plt.plot(df["agreement_dp_rag"], marker="o", label="DP+RAG")
+    plt.title("Index Agreement with Baseline (RAG vs DP+RAG)")
     plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(PLOTS_DIR, "agreement.png"))
     plt.close()
 
-    # DP Semantic Drift
+    # DP sweep NDCG for each sigma
     plt.figure(figsize=(9, 5))
-    plt.plot(df["dp_drift"], marker="o")
-    plt.title("DP Semantic Drift (cosine similarity)")
+    for sigma in DP_SIGMAS:
+        suffix = f"_{sigma}".replace(".", "p")
+        col = f"ndcg_dp{suffix}"
+        if col in df.columns:
+            plt.plot(df[col], marker="o", label=f"DP σ={sigma}")
+    plt.title("DP NDCG Sweep Across Sigmas")
+    plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(PLOTS_DIR, "dp_drift.png"))
-    plt.close()
-
-    # RAG improvement curve
-    plt.figure(figsize=(9, 5))
-    plt.plot(df["rag_improvement"], marker="o")
-    plt.title("RAG Improvement Over DP (Δ NDCG)")
-    plt.tight_layout()
-    plt.savefig(os.path.join(PLOTS_DIR, "rag_improvement.png"))
+    plt.savefig(os.path.join(PLOTS_DIR, "ndcg_dp_sweep.png"))
     plt.close()
 
 
@@ -412,7 +501,7 @@ def plot_results(df):
 def main():
     print("Building full environment fresh...")
 
-    pdf, embeddings, base_index, dp_index, bm25, rag_index, model = build_all(
+    pdf, embeddings, base_index, dp_indices, dp_rag_index, bm25, rag_index, model = build_all(
         DATA_PATH,
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
@@ -421,7 +510,8 @@ def main():
         pdf,
         embeddings,
         base_index,
-        dp_index,
+        dp_indices,
+        dp_rag_index,
         bm25,
         rag_index,
         model
