@@ -1,5 +1,4 @@
 import os
-import sys
 import time
 import numpy as np
 import pandas as pd
@@ -54,8 +53,6 @@ QUERIES = [
 def normalize_rows(mat):
     return mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9)
 
-def norm_vec(v):
-    return v / (np.linalg.norm(v) + 1e-9)
 
 def timed(fn, *args, **kwargs):
     t0 = time.time()
@@ -223,7 +220,15 @@ def evaluate_all(pdf, embeddings, base_index, dp_indices, dp_vecs_map, bm25, rag
         sigma_dp_rag = 0.15
         dp_rag_vecs = dp_vecs_map[sigma_dp_rag]
 
-        dp_rag_rank_pool = dp_rag_vecs @ qv.ravel()
+        # Ensure qv and dp_rag_vecs have matching dimensions for matmul
+        if qv.shape[1] != dp_rag_vecs.shape[1]:
+            # Project or pad qv to match dp_rag_vecs shape
+            qv_proj = np.zeros((1, dp_rag_vecs.shape[1]), dtype=np.float32)
+            qv_proj[0, :qv.shape[1]] = qv[0]
+        else:
+            qv_proj = qv
+
+        dp_rag_rank_pool = dp_rag_vecs @ qv_proj.ravel()
         dp_rag_ids_sorted = np.argsort(dp_rag_rank_pool)[::-1]
         dp_rag_ids = dp_rag_ids_sorted[:TOP_K]
 
