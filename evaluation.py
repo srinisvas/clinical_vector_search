@@ -202,6 +202,33 @@ def build_all(data_path, model_name):
 def evaluate_all(pdf, embeddings, base_index, dp_indices, dp_rag_index, bm25, rag_index, model):
     results = []
 
+    row = {
+    "query": query,
+    "baseline_latency": lat_base,
+    "rag_latency": lat_rag_raw,
+    "dp_rag_latency": lat_dp_rag_raw,
+    }
+
+    # ---- Additional metrics for richer CSV recording ----
+
+    # Baseline always perfect NDCG
+    row["ndcg_baseline"] = 1.0
+
+    # Mean DP drift (how much DP perturbs the query space)
+    row["dp_mean_drift"] = float(np.mean(list(dp_drifts.values())))
+
+    # Mean DP NDCG across all sigma values
+    row["dp_mean_ndcg"] = float(np.mean([
+    ndcg_dp for sigma in DP_SIGMAS
+    for ndcg_dp in [row[f"ndcg_dp_{sigma}".replace('.', 'p')]]
+    ]))
+
+    # DP slowdown factors (latency ratio vs baseline)
+    for sigma in DP_SIGMAS:
+        suffix = f"_{sigma}".replace(".", "p")
+        dp_lat = row[f"dp_latency{suffix}"]
+        row[f"dp_slowdown{suffix}"] = dp_lat / (lat_base + 1e-9)
+
     for query in QUERIES:
         print(f"\nEvaluating: {query}")
 
@@ -493,6 +520,33 @@ def plot_results(df):
     plt.savefig(os.path.join(PLOTS_DIR, "ndcg_dp_sweep.png"))
     plt.close()
 
+    # ---- DP Drift Plot ----
+    plt.figure(figsize=(9, 5))
+    for sigma in DP_SIGMAS:
+        col = f"dp_drift_{sigma}".replace('.', 'p')
+        if col in df.columns:
+            plt.plot(df[col], marker="o", label=f"σ={sigma}")
+    plt.title("DP Drift Across Queries")
+    plt.xlabel("Query Index")
+    plt.ylabel("Cosine Similarity (Query → Noisy Query)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS_DIR, "dp_drift.png"))
+    plt.close()
+
+    # ---- DP Slowdown Plot ----
+    plt.figure(figsize=(9, 5))
+    for sigma in DP_SIGMAS:
+        col = f"dp_slowdown_{sigma}".replace('.', 'p')
+        if col in df.columns:
+            plt.plot(df[col], marker="o", label=f"σ={sigma}")
+    plt.title("DP Slowdown vs Baseline")
+    plt.xlabel("Query Index")
+    plt.ylabel("Slowdown Factor")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS_DIR, "dp_slowdown.png"))
+    plt.close()
 
 # ============================================================
 # Main
